@@ -1,0 +1,4 @@
+# display font is "personal use only" — keep it local, don't publish it
+fonts/
+__pycache__/
+*-keyframes.png
