@@ -2,7 +2,7 @@
 """
 Driven by the unknown — animated ASCII banner for a GitHub profile README.
 
-Timeline of one loop (~8.9 s):
+Timeline of one loop (~8.9 s, 16 fps):
   1. ASCII characters fly in from the right and assemble the text letter by
      letter (D -> r -> i -> ... -> n), each letter fading in its drop shadow.
   2. Short hold with a subtle character shimmer.
@@ -28,7 +28,7 @@ W, H = 1200, 480          # banner size (px). GitHub shows it at ~830 px wide.
 CW, CH = 4, 6             # character cell size (px)
 COLS, ROWS = W // CW, H // CH
 SS = 4                    # supersampling for vector masks
-FPS = 20
+FPS = 16
 LINE1, LINE2 = "Driven by", "the unknown"
 FONT_PX = 205             # display font size
 
@@ -113,9 +113,20 @@ def to_cells(mask_img):
     return cov, np.gradient(bl, axis=1), np.gradient(bl, axis=0)
 
 
-def light(c):
-    """Key light from the right: brighter towards the right edge."""
-    return 0.66 + 0.34 * (c / COLS) ** 0.9
+# spotlight: a hot, blooming key light placed right of centre (near the sword)
+SPOT = (0.66, 0.52)        # centre as fraction of W, H
+SPOT_R = (0.30, 0.55)      # falloff radii as fraction of W, H
+
+
+def spot(x_px, y_px):
+    dx = (x_px / W - SPOT[0]) / SPOT_R[0]
+    dy = (y_px / H - SPOT[1]) / SPOT_R[1]
+    return math.exp(-(dx * dx + dy * dy) * 1.1)
+
+
+def light(c, r=ROWS * 0.5):
+    """Brightness multiplier for a cell: deep shadows far away, near-white in the hot spot."""
+    return 0.32 + 1.05 * spot(c * CW, r * CH)
 
 
 def cell_chars(cov, gx, gy, rnd, thr=0.09, boost=1.0):
@@ -125,7 +136,7 @@ def cell_chars(cov, gx, gy, rnd, thr=0.09, boost=1.0):
         e = math.hypot(gx[r, c], gy[r, c])
         edge = e > 0.09 or v < 0.5
         rim = max(0.0, -gx[r, c]) * 2.2           # rim light on right-facing edges
-        b = min(1.0, ((0.80 + 0.20 * v) * light(c) + rim) * boost)
+        b = min(1.0, ((0.80 + 0.20 * v) * light(c, r) + rim * (0.4 + spot(c * CW, r * CH))) * boost)
         out[(int(r), int(c))] = [rnd.choice(EDGE_CH if edge else FILL_CH), b, edge]
     return out
 
@@ -134,7 +145,7 @@ def shadow_cells(cov, rnd, dx=-4, dy=3):
     sh = ndimage.shift(ndimage.gaussian_filter(cov, 0.8), (dy, dx), order=0)
     out = {}
     for r, c in zip(*np.nonzero((sh > 0.25) & (cov < 0.1))):
-        out[(int(r), int(c))] = [rnd.choice(SHADOW_CH), 0.22 + 0.10 * light(c)]
+        out[(int(r), int(c))] = [rnd.choice(SHADOW_CH), 0.10 + 0.22 * light(c, r)]
     return out
 
 
@@ -257,7 +268,9 @@ def build_scene(font_path):
 
     # assign each cell to the letter that covers it most
     covs = np.stack([to_cells(m)[0] for (_, _, m, *_) in letters])
-    owner = covs.argmax(0)
+    # glyphs drawn alone can differ slightly from the full line (contextual forms),
+    # so give every cell to the *nearest* letter instead of only exact overlaps
+    owner = np.stack([ndimage.gaussian_filter(cv, 2.5) for cv in covs]).argmax(0)
     sh_owner = ndimage.shift(owner, (3, -4), order=0, mode="nearest")
 
     n_letters = len(letters)
@@ -316,7 +329,15 @@ def build_scene(font_path):
             ch["spin"] = hr.random() < 0.5
             ch["life"] = hr.uniform(0.75, 1.0)
 
-    return dict(chars=chars, shadows=shadows, sword=sword, sword_sh=sword_sh,
+    # halftone dust: the light itself shows up as scattered dots on the background
+    drng = random.Random(33)
+    dust = []
+    for r in range(ROWS):
+        for c in range(COLS):
+            I = spot(c * CW, r * CH)
+            if drng.random() < 0.55 * I ** 1.7:
+                dust.append((r, c, drng.choice(".:'.`"), I * drng.uniform(0.25, 0.75)))
+    return dict(dust=dust, chars=chars, shadows=shadows, sword=sword, sword_sh=sword_sh,
                 guard=(ucx_px, guard_y + 2), n_letters=n_letters)
 
 
@@ -335,6 +356,14 @@ def render_frame(sp, scene, fi):
         shake = (1 - (t - T_IMPACT) / 0.2) * 2.5
     jx = rnd.uniform(-shake, shake)
     jy = rnd.uniform(-shake, shake)
+
+    # halftone glow, fades in with the text and flares on impact
+    glow = clamp01((t - 1.0) / 2.5)
+    if t >= T_IMPACT:
+        glow *= 1 + 0.6 * math.exp(-(t - T_IMPACT) / 0.9)
+    if glow > 0:
+        for r, c, ch, b in scene["dust"]:
+            sp.blit(c * CW, r * CH, ch, min(1, b * glow) * fade)
 
     # shadows of settled letters
     for s in scene["shadows"]:
@@ -405,11 +434,13 @@ def render_frame(sp, scene, fi):
             gx, gy = scene["guard"]
             draw_flare(sp, gx, gy, strength * fade, rnd)
 
-    return np.clip(sp.frame() * 1.12, 0, 1)
+    f = sp.frame()
+    bloom = ndimage.gaussian_filter(f, 7)        # soft glow around bright areas
+    return np.clip(f * 1.1 + bloom * 1.6, 0, 1)
 
 
 def save_gif(frames, path):
-    levels = 48
+    levels = 32
     pal = []
     for i in range(levels):
         v = int(round(255 * (i / (levels - 1)) ** 0.9))
